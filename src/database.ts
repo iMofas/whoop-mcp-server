@@ -336,11 +336,15 @@ export class WhoopDatabase {
 	}
 
 	getLatestRecovery(): DbRecovery | null {
-		return this.db.prepare('SELECT * FROM recovery ORDER BY created_at DESC LIMIT 1').get() as DbRecovery | undefined ?? null;
+		// Фильтр recovery_score IS NOT NULL — защита от pending-записей: Whoop может создать
+		// recovery row сразу после конца сна, но рассчитать score через несколько минут.
+		// Без фильтра «свежая» запись с NULL'ом перебивает реально полезную предыдущую.
+		return this.db.prepare('SELECT * FROM recovery WHERE recovery_score IS NOT NULL ORDER BY created_at DESC LIMIT 1').get() as DbRecovery | undefined ?? null;
 	}
 
 	getLatestSleep(): DbSleep | null {
-		return this.db.prepare('SELECT * FROM sleep WHERE is_nap = 0 ORDER BY start_time DESC LIMIT 1').get() as DbSleep | undefined ?? null;
+		// Аналогично — sleep_performance NULL означает, что Whoop ещё не дорассчитал.
+		return this.db.prepare('SELECT * FROM sleep WHERE is_nap = 0 AND sleep_performance IS NOT NULL ORDER BY start_time DESC LIMIT 1').get() as DbSleep | undefined ?? null;
 	}
 
 	getCyclesByDateRange(startDate: string, endDate: string): DbCycle[] {

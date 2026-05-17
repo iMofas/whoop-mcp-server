@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Request, type Response } from 'express';
+import { appendFile } from 'node:fs';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
@@ -341,7 +342,122 @@ async function main(): Promise<void> {
 		process.stderr.write('Whoop MCP server running on stdio\n');
 	} else {
 		const app = express();
-		app.use(express.json());
+		// Доверяем заголовкам X-Forwarded-* от KeenDNS, чтобы видеть реальный IP клиента
+		// и корректный protocol/host в логах.
+		app.set('trust proxy', true);
+
+		// ВАЖНО: парсеры тела НЕ применяем к /mcp — MCP SDK (StreamableHTTPServerTransport)
+		// читает сырой поток req сам. Если тут вызвать express.json(), поток уйдёт в req.body,
+		// и transport.handleRequest упадёт с «stream is not readable» (Claude в UI покажет это
+		// как «Authorization with the MCP server failed», хотя проблема не в OAuth).
+		const jsonParser = express.json();
+		const urlencodedParser = express.urlencoded({ extended: true });
+		app.use((req, res, next) => {
+			if (req.path === '/mcp') {
+				next();
+				return;
+			}
+			jsonParser(req, res, err => {
+				if (err) {
+					next(err);
+					return;
+				}
+				urlencodedParser(req, res, next);
+			});
+		});
+
+		// Логирование каждого входящего HTTP-запроса в stdout (видно в pm2 logs).
+		// Полезно для отладки: видно, кто и куда стучится (Claude/Anthropic, OAuth callback и т.д.).
+		app.use((req: Request, _res: Response, next: () => void) => {
+			const ip = req.ip ?? req.socket.remoteAddress ?? '-';
+			const ua = req.headers['user-agent'] ?? '-';
+			process.stdout.write(`[${new Date().toISOString()}] ${ip} ${req.method} ${req.url} ua="${ua}"\n`);
+			next();
+		});
+
+		// ---- Заглушки MCP OAuth (MCP Authorization spec 2025-06-18) ----
+		// Claude.ai при добавлении custom connector ожидает, что MCP-сервер реализует
+		// OAuth 2.0 со всем discovery (RFC 9728 / 8414 / 7591). Этот форк репы их не
+		// реализует, поэтому подсовываем минимальный «открытый» OAuth: discovery отвечает,
+		// /register возвращает фиктивного клиента, /authorize сразу редиректит обратно
+		// с подложным code, /token выдаёт подложный bearer. Реальная защита /mcp нам не
+		// нужна — сервер крутится в локальной сети за KeenDNS и доступен только нам.
+
+		// База публичного URL сервера — берём из WHOOP_REDIRECT_URI, обрезая /callback.
+		const PUBLIC_URL = (process.env.WHOOP_REDIRECT_URI ?? '').replace(/\/callback$/, '');
+
+		// RFC 9728 — описание защищённого ресурса. Claude ходит и в общую форму,
+		// и в форму с суффиксом ресурса (/mcp), отвечаем одинаково.
+		const protectedResource = (_req: Request, res: Response) => {
+			res.json({
+				resource: `${PUBLIC_URL}/mcp`,
+				authorization_servers: [PUBLIC_URL],
+			});
+		};
+		app.get('/.well-known/oauth-protected-resource', protectedResource);
+		app.get('/.well-known/oauth-protected-resource/mcp', protectedResource);
+
+		// RFC 8414 — метаданные OAuth Authorization Server.
+		app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
+			res.json({
+				issuer: PUBLIC_URL,
+				authorization_endpoint: `${PUBLIC_URL}/authorize`,
+				token_endpoint: `${PUBLIC_URL}/token`,
+				registration_endpoint: `${PUBLIC_URL}/register`,
+				response_types_supported: ['code'],
+				grant_types_supported: ['authorization_code', 'refresh_token'],
+				code_challenge_methods_supported: ['S256'],
+				token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+			});
+		});
+
+		// RFC 7591 — Dynamic Client Registration. Возвращаем фиктивные client_id/secret.
+		// Эхо назад полей запроса нужно, чтобы клиент не ругнулся на отсутствие redirect_uris.
+		app.post('/register', (req: Request, res: Response) => {
+			const body = (req.body ?? {}) as Record<string, unknown>;
+			res.status(201).json({
+				client_id: 'stub-client',
+				client_secret: 'stub-secret',
+				client_id_issued_at: Math.floor(Date.now() / 1000),
+				redirect_uris: body.redirect_uris ?? [],
+				grant_types: body.grant_types ?? ['authorization_code'],
+				response_types: body.response_types ?? ['code'],
+				token_endpoint_auth_method: body.token_endpoint_auth_method ?? 'none',
+			});
+		});
+
+		// Authorization endpoint — мгновенно редиректит на redirect_uri с фиктивным code.
+		// State обязательно эхом, иначе клиент отбракует ответ как CSRF.
+		app.get('/authorize', (req: Request, res: Response) => {
+			const redirectUri = req.query.redirect_uri as string | undefined;
+			const state = req.query.state as string | undefined;
+			if (!redirectUri) {
+				res.status(400).send('Missing redirect_uri');
+				return;
+			}
+			let url: URL;
+			try {
+				url = new URL(redirectUri);
+			} catch {
+				res.status(400).send('Invalid redirect_uri');
+				return;
+			}
+			url.searchParams.set('code', 'stub-auth-code');
+			if (state) url.searchParams.set('state', state);
+			res.redirect(302, url.toString());
+		});
+
+		// Token endpoint — отдаёт фиктивный bearer на любой запрос.
+		app.post('/token', (_req: Request, res: Response) => {
+			res.json({
+				access_token: 'stub-access-token',
+				token_type: 'Bearer',
+				expires_in: 31536000,
+				refresh_token: 'stub-refresh-token',
+				scope: 'read',
+			});
+		});
+		// ---- конец заглушек MCP OAuth ----
 
 		app.get('/callback', async (req: Request, res: Response) => {
 			const code = req.query.code as string | undefined;
@@ -367,6 +483,7 @@ async function main(): Promise<void> {
 		app.all('/mcp', async (req: Request, res: Response) => {
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
+			// DELETE с известной сессией — закрываем явно (transport SDK сам это не делает).
 			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
 				const session = transports.get(sessionId)!;
 				await session.transport.close();
@@ -375,26 +492,124 @@ async function main(): Promise<void> {
 				return;
 			}
 
+			// POST: первый запрос (initialize) создаёт сессию; последующие используют существующую
+			// по заголовку Mcp-Session-Id.
 			if (req.method === 'POST') {
+				// Читаем сырое тело сами, чтобы (1) залогировать его в trace для отладки Claude.ai
+				// proxy bug, (2) передать SDK уже распарсенным через параметр parsedBody —
+				// иначе SDK сам вызовет getRawBody(req), а после нашего чтения поток уже пуст.
+				const chunks: Buffer[] = [];
+				for await (const chunk of req) {
+					chunks.push(chunk as Buffer);
+				}
+				const rawBody = Buffer.concat(chunks).toString('utf8');
+				let parsedBody: unknown;
+				try {
+					parsedBody = JSON.parse(rawBody);
+				} catch (e) {
+					appendFile(
+						'/Users/mofas/.pm2/logs/whoop-mcp-mcp-trace.log',
+						`[${new Date().toISOString()}] REQUEST PARSE_FAIL ua="${req.headers['user-agent'] ?? '-'}" session=${sessionId ?? '-'} body=${JSON.stringify(rawBody)} err=${(e as Error).message}\n`,
+						() => {},
+					);
+					res.status(400).json({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null });
+					return;
+				}
+				// trace-лог: пишем без блокировки. Тела урезаем до 500 символов, чтобы файл
+				// не разрастался — для отладки достаточно увидеть метод, params и начало результата.
+				const reqBodyStr = JSON.stringify(parsedBody);
+				const reqBodyTrimmed = reqBodyStr.length > 500 ? reqBodyStr.slice(0, 500) + `...[+${reqBodyStr.length - 500}B]` : reqBodyStr;
+				appendFile(
+					'/Users/mofas/.pm2/logs/whoop-mcp-mcp-trace.log',
+					`[${new Date().toISOString()}] REQUEST ua="${req.headers['user-agent'] ?? '-'}" session=${sessionId ?? '-'} ct="${req.headers['content-type'] ?? '-'}" accept="${req.headers.accept ?? '-'}" body=${reqBodyTrimmed}\n`,
+					() => {},
+				);
+
+				// Извлекаем method/id из тела для корректных ответов на edge-cases.
+				const requestMethod =
+					typeof parsedBody === 'object' && parsedBody !== null && 'method' in parsedBody
+						? (parsedBody as { method?: unknown }).method
+						: undefined;
+				const requestId =
+					typeof parsedBody === 'object' && parsedBody !== null && 'id' in parsedBody
+						? (parsedBody as { id?: unknown }).id
+						: null;
+
 				let transport: StreamableHTTPServerTransport;
 
 				if (sessionId && transports.has(sessionId)) {
+					// Известная сессия — переиспользуем существующий transport.
 					const session = transports.get(sessionId)!;
 					session.lastAccess = Date.now();
 					transport = session.transport;
-				} else {
+				} else if (sessionId) {
+					// Клиент шлёт session_id, которой у нас нет (типично — после pm2 restart
+					// наш Map в памяти обнуляется, но Anthropic-прокси кеширует session_id у себя).
+					// По спеке MCP Streamable HTTP клиент в этом случае ДОЛЖЕН переинициализироваться:
+					// мы отвечаем 404, клиент шлёт новый initialize → получает новый session_id.
+					res.status(404).json({
+						jsonrpc: '2.0',
+						error: { code: -32001, message: 'Session not found; please re-initialize' },
+						id: requestId ?? null,
+					});
+					return;
+				} else if (requestMethod === 'initialize') {
+					// Нет сессии и это initialize — нормальный first contact, создаём transport.
 					transport = new StreamableHTTPServerTransport({
 						sessionIdGenerator: () => crypto.randomUUID(),
 						onsessioninitialized: newSessionId => {
 							transports.set(newSessionId, { transport, lastAccess: Date.now() });
 						},
+						// Возвращаем одиночный JSON вместо SSE-стрима. Спека MCP Streamable HTTP
+						// разрешает оба варианта, но Anthropic-прокси в Claude.ai на text/event-stream
+						// падает с «Invalid content from server». Для наших инструментов streaming
+						// не нужен (короткие ответы, без долгих операций), JSON безопаснее.
+						enableJsonResponse: true,
 					});
 
 					const server = createMcpServer();
 					await server.connect(transport);
+				} else {
+					// Нет сессии и НЕ initialize — клиент идёт мимо протокола, отвечаем 400.
+					res.status(400).json({
+						jsonrpc: '2.0',
+						error: { code: -32600, message: 'Initialize required before other methods' },
+						id: requestId ?? null,
+					});
+					return;
 				}
 
-				await transport.handleRequest(req, res);
+				// Перехват записи ответа — пишем тело в тот же trace-лог.
+				// res.write/res.end перегружены в типах Node, поэтому используем any для оборачивания.
+				const origEnd = res.end.bind(res);
+				const origWrite = res.write.bind(res);
+				const respChunks: Buffer[] = [];
+				(res.write as unknown) = (chunk: unknown, ...args: unknown[]) => {
+					if (chunk) respChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+					return (origWrite as (...a: unknown[]) => unknown)(chunk, ...args);
+				};
+				(res.end as unknown) = (chunk: unknown, ...args: unknown[]) => {
+					if (chunk) respChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+					const respBody = Buffer.concat(respChunks).toString('utf8');
+					const respTrimmed = respBody.length > 500 ? respBody.slice(0, 500) + `...[+${respBody.length - 500}B]` : respBody;
+					appendFile(
+						'/Users/mofas/.pm2/logs/whoop-mcp-mcp-trace.log',
+						`[${new Date().toISOString()}] RESPONSE status=${res.statusCode} session=${sessionId ?? '-'} length=${respBody.length} body=${respTrimmed}\n`,
+						() => {},
+					);
+					return (origEnd as (...a: unknown[]) => unknown)(chunk, ...args);
+				};
+
+				await transport.handleRequest(req, res, parsedBody);
+				return;
+			}
+
+			// GET: клиент открывает SSE для серверных уведомлений в рамках существующей сессии.
+			// Делегируем тому же transport — он сам стримит события.
+			if (req.method === 'GET' && sessionId && transports.has(sessionId)) {
+				const session = transports.get(sessionId)!;
+				session.lastAccess = Date.now();
+				await session.transport.handleRequest(req, res);
 				return;
 			}
 

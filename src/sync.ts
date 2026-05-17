@@ -77,9 +77,14 @@ export class WhoopSync {
 		}
 
 		const lastSync = new Date(state.lastSyncAt);
-		const hoursSinceSync = (Date.now() - lastSync.getTime()) / (1000 * 60 * 60);
+		const minutesSinceSync = (Date.now() - lastSync.getTime()) / (1000 * 60);
 
-		if (hoursSinceSync < 1) {
+		// Cache TTL — 5 минут. В upstream было 60 минут, из-за чего утренние recovery scores
+		// (Whoop публикует их когда пользователь просыпается) не подтягивались часами:
+		// предыдущий sync был ночью, hoursSinceSync < 1, smartSync пропускал → get_today
+		// возвращал вчерашние данные. 5 минут — компромисс между «всегда свежее» и «не дёргать
+		// 4 эндпоинта Whoop на каждый MCP-вызов».
+		if (minutesSinceSync < 5) {
 			return { type: 'skip' };
 		}
 
