@@ -59,8 +59,11 @@ export interface WhoopSleep {
 	timezone_offset: string;
 	nap: boolean;
 	score_state: 'SCORED' | 'PENDING_SCORE' | 'UNSCORABLE';
+	// Поля помечены опциональными: для pending/UNSCORABLE-записей Whoop отдаёт
+	// score без вложенных stage_summary / sleep_needed, и попытка обратиться
+	// к ним напрямую падает с TypeError.
 	score?: {
-		stage_summary: {
+		stage_summary?: {
 			total_in_bed_time_milli: number;
 			total_awake_time_milli: number;
 			total_no_data_time_milli: number;
@@ -70,7 +73,7 @@ export interface WhoopSleep {
 			sleep_cycle_count: number;
 			disturbance_count: number;
 		};
-		sleep_needed: {
+		sleep_needed?: {
 			baseline_milli: number;
 			need_from_sleep_debt_milli: number;
 			need_from_recent_strain_milli: number;
@@ -93,13 +96,15 @@ export interface WhoopWorkout {
 	timezone_offset: string;
 	sport_id: number;
 	score_state: 'SCORED' | 'PENDING_SCORE' | 'UNSCORABLE';
+	// zone_duration отсутствует у воркаутов без полной HR-разметки
+	// (короткие/ручные сессии, ещё не обсчитанные Whoop) — поэтому опционально.
 	score?: {
 		strain: number;
 		average_heart_rate: number;
 		max_heart_rate: number;
 		kilojoule: number;
 		percent_recorded: number;
-		zone_duration: {
+		zone_duration?: {
 			zone_zero_milli: number;
 			zone_one_milli: number;
 			zone_two_milli: number;
