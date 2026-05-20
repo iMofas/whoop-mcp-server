@@ -164,8 +164,15 @@ function createMcpServer(): Server {
 				client.setTokens(tokens);
 				try {
 					await sync.smartSync();
-				} catch {
-					// Continue with cached data
+				} catch (e) {
+					// Если синк упал — продолжаем с тем, что лежит в SQLite, чтобы Claude
+					// хоть какой-то ответ получил. Но ошибку обязательно логируем в stdout,
+					// иначе как это было до 2026-05-20 — БД молча застывала на сутки,
+					// а в логах было пусто. Теперь любая поломка авто-синка сразу видна
+					// в `pm2 logs whoop-mcp`.
+					process.stdout.write(
+						`[${new Date().toISOString()}] smartSync error in ${name}: ${e instanceof Error ? e.message : String(e)}\n`
+					);
 				}
 			}
 
@@ -624,7 +631,68 @@ async function main(): Promise<void> {
 			process.stdout.write(`Whoop MCP server running on http://0.0.0.0:${config.port}\n`);
 		});
 
+		// ---- Утренний автосинк ----
+		// Whoop публикует recovery/HRV/RHR утром после пробуждения. Если в этот момент
+		// никто не дёргает MCP (Claude.ai сессии открываются раз в несколько часов),
+		// БД остаётся со вчерашними данными — это и вызвало путаницу 2026-05-20, когда
+		// в чате весь день показывались позавчерашние recovery 88% / HRV 102.4.
+		//
+		// Решение: каждый час с 07:00 до 13:00 по Москве сам тянем quickSync (7 дней).
+		// Это семь автоматических апдейтов в утреннее окно — даже если Claude в это
+		// время вообще ни разу не вызывался, к 13:00 БД точно содержит сегодняшний
+		// recovery, сон прошлой ночи и весь утренний strain.
+		//
+		// Москва = UTC+3, постоянно (Россия отменила переход на летнее время в 2014).
+		// Окно ширина 7 часов (07,08,09,10,11,12,13) — с запасом покрывает любое
+		// время пробуждения и публикации Whoop.
+		let lastMorningSyncHour: number | null = null;
+		let lastMorningSyncDay: string | null = null;
+
+		const morningSyncTick = async (): Promise<void> => {
+			const now = new Date();
+			// Преобразуем UTC → Москва сдвигом миллисекунд, затем читаем UTC-методы.
+			const moscow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+			const moscowHour = moscow.getUTCHours();
+			const moscowDay = moscow.toISOString().slice(0, 10);
+
+			// Вне окна 07:00–13:59 по Москве — ничего не делаем.
+			if (moscowHour < 7 || moscowHour > 13) return;
+			// В этот час сегодня уже синкнули — повторно не дёргаем.
+			if (lastMorningSyncDay === moscowDay && lastMorningSyncHour === moscowHour) return;
+
+			const tokens = db.getTokens();
+			if (!tokens) {
+				process.stdout.write(
+					`[${now.toISOString()}] morning auto-sync skipped (Moscow ${moscowHour}:00): no Whoop tokens\n`
+				);
+				return;
+			}
+			client.setTokens(tokens);
+			try {
+				const stats = await sync.quickSync();
+				lastMorningSyncDay = moscowDay;
+				lastMorningSyncHour = moscowHour;
+				process.stdout.write(
+					`[${now.toISOString()}] morning auto-sync OK (Moscow ${moscowHour}:00): ` +
+					`cycles=${stats.cycles} recoveries=${stats.recoveries} sleeps=${stats.sleeps} workouts=${stats.workouts}\n`
+				);
+			} catch (e) {
+				// НЕ обновляем lastMorningSyncHour — следующий тик через 10 минут попробует ещё раз.
+				process.stdout.write(
+					`[${now.toISOString()}] morning auto-sync FAILED (Moscow ${moscowHour}:00): ` +
+					`${e instanceof Error ? e.message : String(e)}\n`
+				);
+			}
+		};
+
+		// Тикаем каждые 10 минут. В окне 7..13 это даст один успешный синк на каждый
+		// час; если синк упал — повторим через 10 минут. Вне окна — мгновенный return.
+		const morningSyncInterval = setInterval(() => { void morningSyncTick(); }, 10 * 60 * 1000);
+		// Если pm2 рестартанул сервер уже внутри окна — не ждать до следующего тика.
+		void morningSyncTick();
+
 		const shutdown = (): void => {
+			clearInterval(morningSyncInterval);
 			process.stdout.write('\nShutting down...\n');
 			for (const [, session] of transports) {
 				session.transport.close().catch(() => {});
