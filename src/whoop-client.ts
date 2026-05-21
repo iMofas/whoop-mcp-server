@@ -32,6 +32,13 @@ export class WhoopClient {
 	private readonly clientSecret: string;
 	private readonly redirectUri: string;
 	private readonly onTokenRefresh?: (tokens: WhoopTokens) => void;
+	// Single-flight на refresh: если refresh уже идёт — параллельные вызовы ждут его,
+	// а не шлют свои запросы с тем же refresh_token. Whoop инвалидирует refresh_token
+	// после первого успешного использования, поэтому без этого 2..N одновременных
+	// refresh-вызовов всегда заканчиваются 400 «invalid_request» (видно в логах
+	// 2026-05-21 04:02 / 05:02 / 07:02 — наш утренний планировщик гонялся с
+	// Claude.ai-запросом за один и тот же refresh-токен).
+	private refreshInFlight: Promise<void> | null = null;
 
 	constructor(config: WhoopClientConfig) {
 		this.clientId = config.clientId;
@@ -41,6 +48,15 @@ export class WhoopClient {
 	}
 
 	setTokens(tokens: WhoopTokens): void {
+		// Не перезаписываем уже более свежими in-memory токены устаревшими данными из БД.
+		// Окно гонки: refresh завершился → новые токены в `this.tokens` → onTokenRefresh
+		// колбэк ещё не успел сохранить в SQLite → параллельный handler читает БД → получает
+		// старые токены → вызывает setTokens(старые) → теряем свежие в памяти.
+		// Считаем «свежими» по expires_at: больше — новее. При повторной авторизации
+		// expires_at всегда смещается далеко в будущее, так что условие сработает.
+		if (this.tokens && tokens.expires_at < this.tokens.expires_at) {
+			return;
+		}
 		this.tokens = tokens;
 	}
 
@@ -84,6 +100,23 @@ export class WhoopClient {
 	}
 
 	private async refreshTokens(): Promise<void> {
+		// Если refresh уже выполняется в этом процессе — переиспользуем тот же Promise,
+		// не запускаем второй параллельный POST /token. См. комментарий у refreshInFlight.
+		if (this.refreshInFlight) {
+			return this.refreshInFlight;
+		}
+
+		this.refreshInFlight = this.doRefreshTokens();
+		try {
+			await this.refreshInFlight;
+		} finally {
+			// Снимаем замок в любом случае (успех или ошибка) — иначе одна неудачная
+			// попытка навсегда заблокирует будущие refresh.
+			this.refreshInFlight = null;
+		}
+	}
+
+	private async doRefreshTokens(): Promise<void> {
 		if (!this.tokens?.refresh_token) {
 			throw new Error('No refresh token available');
 		}
@@ -118,6 +151,10 @@ export class WhoopClient {
 			throw new Error('Not authenticated');
 		}
 
+		// Если до экспайра меньше 5 минут — обновляемся заранее. refreshTokens()
+		// сам сериализует параллельные вызовы, так что при Promise.all() из sync.ts
+		// четыре одновременных request<T>() приведут только к одному реальному
+		// POST /token.
 		if (this.tokens.expires_at - Date.now() < 5 * 60 * 1000) {
 			await this.refreshTokens();
 		}
